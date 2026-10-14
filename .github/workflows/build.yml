@@ -1,0 +1,119 @@
+name: build
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if the Flatcar version is already published
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      flatcar_version: ${{ steps.versions.outputs.flatcar_version }}
+      k3s_version: ${{ steps.versions.outputs.k3s_version }}
+    steps:
+      - id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flatcar_version=$(curl -fsSL https://stable.release.flatcar-linux.net/arm64-usr/current/version.txt | sed -n 's/^FLATCAR_VERSION=//p')
+          tags=$(gh release list -R flatcar/sysext-bakery --limit 1000 --json tagName --jq '.[].tagName')
+          k3s_version=$(echo "$tags" | sed -n 's/^k3s-\(v[0-9]*\.[0-9]*\.[0-9]*+k3s[0-9]*\)$/\1/p' | sort -V | tail -n 1)
+          test -n "$flatcar_version"
+          test -n "$k3s_version"
+          echo "flatcar_version=$flatcar_version" >> "$GITHUB_OUTPUT"
+          echo "k3s_version=$k3s_version" >> "$GITHUB_OUTPUT"
+          echo "Flatcar $flatcar_version, k3s $k3s_version" >> "$GITHUB_STEP_SUMMARY"
+      - id: decide
+        env:
+          FLATCAR_VERSION: ${{ steps.versions.outputs.flatcar_version }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+          IMAGE: ${{ github.repository }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ github.token }}
+        run: |
+          build=true
+          if [ "$EVENT" != push ] && [ "$FORCE" != true ]; then
+            build=false
+            token=$(curl -fsS -u "$GHCR_USER:$GHCR_PASSWORD" "https://ghcr.io/token?scope=repository:$IMAGE:pull" | jq -r .token)
+            for tag in "$FLATCAR_VERSION" "$FLATCAR_VERSION-k3s"; do
+              status=$(curl -sS -o /dev/null -I -w '%{http_code}' \
+                -H "Authorization: Bearer $token" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
+                "https://ghcr.io/v2/$IMAGE/manifests/$tag")
+              case $status in
+                200) ;;
+                404) build=true ;;
+                *)
+                  echo "GHCR returned $status for $IMAGE:$tag" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  disk:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        variant: [flatcar, flatcar-k3s]
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs lvm2 gawk zstd
+      - run: ./scripts/build-disk.sh "${{ matrix.variant }}" "${{ needs.check.outputs.flatcar_version }}" "${{ needs.check.outputs.k3s_version }}" "$RUNNER_TEMP/disk.img.zst"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: disk-${{ matrix.variant }}
+          path: ${{ runner.temp }}/disk.img.zst
+          compression-level: 0
+          retention-days: 1
+
+  package:
+    needs: [check, disk]
+    runs-on: macos-15
+    strategy:
+      matrix:
+        variant: [flatcar, flatcar-k3s]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: disk-${{ matrix.variant }}
+          path: ${{ runner.temp }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R cirruslabs/tart --pattern 'tart.tar.gz' --pattern 'tart_*_checksums.txt' --dir "$RUNNER_TEMP/tart"
+          cd "$RUNNER_TEMP/tart"
+          shasum -a 256 -c tart_*_checksums.txt
+          tar xzf tart.tar.gz
+          echo "$RUNNER_TEMP/tart/tart.app/Contents/MacOS" >> "$GITHUB_PATH"
+          command -v zstd || brew install zstd
+      - env:
+          TART_REGISTRY_HOSTNAME: ghcr.io
+          TART_REGISTRY_USERNAME: ${{ github.actor }}
+          TART_REGISTRY_PASSWORD: ${{ github.token }}
+        run: ./scripts/package-tart.sh "${{ matrix.variant }}" "${{ needs.check.outputs.flatcar_version }}" "$RUNNER_TEMP/disk.img.zst" "ghcr.io/${{ github.repository }}" "${{ github.server_url }}/${{ github.repository }}"
